@@ -1,0 +1,293 @@
+import os
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import numpy as np
+
+MULTI_CLASS_LABELS = {
+    "non tumor": 0,
+    "osteochondroma": 1,
+    "multiple osteochondromas": 2,
+    "simple bone cyst": 3,
+    "giant cell tumor": 4,
+    "osteofibroma": 5,
+    "synovial osteochondroma": 6,
+    "other bt": 7,
+    "osteosarcoma": 8,
+    "other mt": 9
+}
+
+THREE_CLASS_LABELS = {
+    "non tumor": 0,
+    "benign": 1,
+    "malignant": 2
+}
+    
+
+
+class ExcelDataset(Dataset):
+    def __init__(self, dataframe, img_dir=None, transform=None):
+        self.df = dataframe.reset_index(drop=True)
+        self.img_dir = img_dir
+        self.df['full_path'] = self.df['image_id'].apply(
+          lambda x: os.path.join(self.img_dir, x) if self.img_dir else x
+        )
+
+        self.df = self.df[self.df['full_path'].apply(os.path.exists)].reset_index(drop=True)
+        self.transform = transform 
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+
+          # ======================
+        img_name = self.df.iloc[idx]['image_id']
+
+        if self.img_dir is not None:
+          img_path = os.path.join(self.img_dir, img_name)
+        else:
+          img_path = img_name
+                  
+        # ======================
+        label = self.df.iloc[idx]['tumor']
+
+        # ======================
+        image = Image.open(img_path).convert("RGB")
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, torch.tensor(label, dtype=torch.long)
+
+class ExcelDataset_MultiTask(Dataset):
+    def __init__(self, dataframe, img_dir=None, transform=None, label_col='tumor'):
+        self.df = dataframe.reset_index(drop=True).copy()
+        self.img_dir = img_dir
+        self.transform = transform
+        self.label_col = label_col
+
+        self.df['full_path'] = self.df['image_id'].apply(
+            lambda x: os.path.join(self.img_dir, x) if self.img_dir else x
+        )
+
+        self.df = self.df[self.df['full_path'].apply(os.path.exists)].reset_index(drop=True)
+
+        classes = sorted(self.df[self.label_col].dropna().unique().tolist())
+        self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
+        self.idx_to_class = {idx: cls_name for cls_name, idx in self.class_to_idx.items()}
+
+        self.df['label_idx'] = self.df[self.label_col].map(self.class_to_idx)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        img_path = self.df.iloc[idx]['full_path']
+        label = int(self.df.iloc[idx]['label_idx'])
+
+        image = Image.open(img_path).convert("RGB")
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, torch.tensor(label, dtype=torch.long)
+
+class FracAtlasDataset(Dataset):
+    def __init__(self, df, img_dir, transform=None):
+        self.df = df.reset_index(drop=True)
+        self.img_dir = img_dir
+        self.transform = transform
+        
+        # Filter out corrupted images during initialization
+        valid_indices = []
+        for idx in range(len(self.df)):
+            row = self.df.iloc[idx]
+            label = int(row["fractured"])
+            img_name = row["image_id"]
+            folder = "Fractured" if label == 1 else "Non_fractured"
+            img_path = os.path.join(self.img_dir, folder, img_name)
+            
+            if not os.path.exists(img_path):
+                print(f"[WARN] Image not found: {img_path}")
+                continue
+            
+            try:
+                # Try to open and load the image to catch truncated images
+                with Image.open(img_path) as img:
+                    img.load()  # This will raise OSError for truncated images
+                valid_indices.append(idx)
+            except (OSError, IOError) as e:
+                # print(f"[WARN] Corrupted/truncated image skipped: {img_path} | Error: {str(e)}")
+                continue
+        
+        # Keep only valid rows
+        self.df = self.df.iloc[valid_indices].reset_index(drop=True)
+        print(f"[INFO] Loaded {len(self.df)} valid images out of {len(df)} total")
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        label = int(row["fractured"])
+        img_name = row["image_id"]
+        folder = "Fractured" if label == 1 else "Non_fractured"
+        img_path = os.path.join(self.img_dir, folder, img_name)
+        
+        image = Image.open(img_path).convert("RGB")
+
+        if self.transform:
+            image = self.transform(image)
+        
+        return image, torch.tensor(label, dtype=torch.long)
+
+class InMemoryDataset(Dataset):
+    def __init__(self, images, labels, transform=None):
+        self.images = images
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        image = self.images[idx]
+        if self.transform:
+            image = self.transform(image)
+        return image, self.labels[idx]
+
+def preload_dataset_to_ram(df, img_dir, datasets_type="BTXRD"):
+    cached_images = []
+    cached_labels = []
+    kept_rows = []
+
+    for _, row in df.reset_index(drop=True).iterrows():
+        if datasets_type == "BTXRD":
+            label = int(row["tumor"])
+            img_path = os.path.join(img_dir, row["image_id"])
+        elif datasets_type == "FracAtlas":
+            label = int(row["fractured"])
+            folder = "Fractured" if label == 1 else "Non_fractured"
+            img_path = os.path.join(img_dir, folder, row["image_id"])
+        else:
+            raise ValueError(f"Unsupported dataset type: {datasets_type}")
+
+        if not os.path.exists(img_path):
+            continue
+
+        try:
+            with Image.open(img_path) as img:
+                image = img.convert("RGB")
+        except (OSError, IOError):
+            continue
+
+        cached_images.append(image)
+        cached_labels.append(torch.tensor(label, dtype=torch.long))
+        kept_rows.append(row)
+
+    filtered_df = pd.DataFrame(kept_rows).reset_index(drop=True)
+    return InMemoryDataset(cached_images, cached_labels), filtered_df
+
+
+#TODO: change to more classes
+def preload_dataset_to_ram_multiclasses(df, img_dir, datasets_type="BTXRD", label_map=MULTI_CLASS_LABELS):
+    """
+    label_map: dict, mapping of label names to integer IDs for multi-class classification
+    e.g., {"non tumor": 0, "benign": 1, "malignant": 2, ...}
+    """
+    
+    cached_images = []
+    cached_labels = []
+    kept_rows = []
+
+    image_col = "image_id" if "image_id" in df.columns else "imageid"
+    
+    label_map = label_map
+    label_list = list(label_map.keys())
+       
+    if "non tumor" not in label_list:
+        label_list.append("non tumor")
+        label_map["non tumor"] = len(label_map)  # Ensure "non tumor" is always present in the label map
+    
+    if datasets_type != "BTXRD":
+        raise ValueError(f"Unsupported dataset type: {datasets_type}")
+    
+    for _, row in df.reset_index(drop=True).iterrows():
+        img_path = os.path.join(img_dir, row[image_col])
+        
+        if not os.path.exists(img_path):
+            continue
+        try:
+            with Image.open(img_path) as img:
+                image = img.convert("RGB").copy()
+        except (OSError, IOError):
+            continue
+        
+        if row["tumor"] == 0:
+            label = label_map["non tumor"]
+        else:
+            for label_name in label_list:
+                if label_name == "non tumor":
+                    continue
+                if row.get(label_name) == 1:
+                    label = label_map[label_name]
+                    break
+
+        row_dict = row.to_dict()
+        row_dict["label"] = label
+        kept_rows.append(row_dict)
+
+        cached_images.append(image)
+        cached_labels.append(torch.tensor(label, dtype=torch.long))
+
+    filtered_df = pd.DataFrame(kept_rows).reset_index(drop=True)
+    return InMemoryDataset(cached_images, cached_labels), filtered_df
+    
+
+def multi_class_preprocess(
+    df,
+    datasets_type="BTXRD",
+    return_names=False,
+    label_map=MULTI_CLASS_LABELS
+):
+    if datasets_type != "BTXRD":
+        raise ValueError(f"Unsupported dataset type: {datasets_type}")
+
+    labels = dict(label_map)
+
+    if "non tumor" not in labels:
+        labels["non tumor"] = len(labels)
+
+    label_list = list(labels.keys())
+
+    y = []
+    label_names = []
+
+    for _, row in df.reset_index(drop=True).iterrows():
+        if int(row["tumor"]) == 0:
+            label_name = "non tumor"
+        else:
+            label_name = None
+            for cls_name in label_list:
+                if cls_name == "non tumor":
+                    continue
+                if row.get(cls_name, 0) == 1:
+                    label_name = cls_name
+                    break
+
+            if label_name is None:
+                raise ValueError(f"No valid positive class found for row {row.name}")
+
+        y.append(labels[label_name])
+        label_names.append(label_name)
+
+    y = np.asarray(y, dtype=np.int64)
+
+    if return_names:
+        return y, label_names
+
+    return y
+
+# TODO: class segmentation dataset
